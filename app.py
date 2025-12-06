@@ -14,11 +14,46 @@ except Exception:
     st.error("⚠️ API Key fehlt. Bitte in den Streamlit Secrets eintragen.")
     st.stop()
 
-# --- 2. DEINE DEFINITIONEN (Die "White-List") ---
+# --- 2. INTELLIGENTE MODELL-SUCHE (Der Fix!) ---
+@st.cache_resource
+def get_best_model_name():
+    """Fragt die API, welche Modelle verfügbar sind und wählt das beste aus."""
+    try:
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        
+        # Prioritätenliste: Wir suchen nach diesen Modellen in dieser Reihenfolge
+        priorities = [
+            "gemini-1.5-flash",      # Der Schnellste (Alias)
+            "gemini-1.5-flash-001",  # Der Schnellste (Versioniert)
+            "gemini-1.5-pro",        # Der Starke
+            "gemini-1.5-pro-001",
+            "gemini-pro"             # Der Klassiker (Fallback)
+        ]
+        
+        # Check: Ist eines unserer Wunschmodelle in der Liste der verfügbaren?
+        # Die API gibt oft 'models/gemini-1.5-flash' zurück, daher prüfen wir 'endswith'
+        for p in priorities:
+            for av in available_models:
+                if av.endswith(p):
+                    return av # Gefunden! z.B. 'models/gemini-1.5-flash-001'
+        
+        # Wenn nichts passt, nimm einfach das allererste Gemini Modell
+        if available_models:
+            return available_models[0]
+            
+        return "models/gemini-1.5-flash" # Harter Fallback falls ListModels fehlschlägt
+        
+    except Exception as e:
+        # Falls die Liste nicht abgerufen werden kann, versuchen wir den Standard
+        return "gemini-1.5-flash"
+
+# --- 3. INHALTS-DEFINITIONEN ---
 
 COUNTRIES_ENT = "UK, Deutschland, Österreich, Schweiz, USA, Japan, Südkorea"
 
-# Damit der Prompt nicht platzt, fassen wir zusammen, aber bleiben präzise
 SPORT_LISTE = """
 FUSSBALL:
 - DE: 1. & 2. Bundesliga, DFB Pokal, Frauen-Bundesliga
@@ -38,17 +73,22 @@ US-SPORT: NFL, NBA, NHL, MLB.
 
 IGNORE_LIST = "Keine Serien, keine Filme (Movies), keine Nachrichten, keine Talkshows, keine Wiederholungen."
 
-# --- 3. KI-FUNKTIONEN ---
+# --- 4. DATA FETCHING ---
 
 def get_date_str():
     now = datetime.now()
-    # Wir schauen immer für heute und morgen
     return now.strftime("%d.%m.%Y"), (now + timedelta(days=1)).strftime("%d.%m.%Y")
 
-@st.cache_data(ttl=3600) # Cache 1 Stunde
+@st.cache_data(ttl=3600)
 def fetch_data(category):
     today, tomorrow = get_date_str()
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    # Hier nutzen wir jetzt die Auto-Erkennung
+    model_name = get_best_model_name()
+    model = genai.GenerativeModel(model_name)
+    
+    # Info für dich im Frontend (damit du siehst, welches Modell läuft)
+    st.toast(f"Benutze Modell: {model_name}", icon="🤖")
     
     if category == "Sport":
         prompt = f"""
@@ -95,7 +135,7 @@ def fetch_data(category):
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --- 4. DATA CLEANING ---
+# --- 5. DATA CLEANING ---
 
 def process_csv(raw_text, columns):
     clean = raw_text.replace("```csv", "").replace("```", "").strip()
@@ -105,7 +145,7 @@ def process_csv(raw_text, columns):
     except:
         return pd.DataFrame()
 
-# --- 5. APP UI ---
+# --- 6. APP UI ---
 
 st.title("🌍 Global Live Guide")
 st.markdown(f"**Status:** {datetime.now().strftime('%H:%M')} MEZ | **Fokus:** {COUNTRIES_ENT}")
@@ -118,7 +158,8 @@ with tab_sport:
         with st.spinner("Scanne weltweite Sport-Ligen..."):
             raw = fetch_data("Sport")
             if "Error" in raw:
-                st.error(raw)
+                st.error(f"Fehler beim Abruf: {raw}")
+                st.info("Tipp: Überprüfe deinen API Key in den Secrets.")
             else:
                 cols = ["Datum", "Uhrzeit", "Sportart", "Wettbewerb", "Heim", "Gast", "Sender"]
                 df_sport = process_csv(raw, cols)
@@ -148,7 +189,7 @@ with tab_ent:
         with st.spinner("Suche Shows in UK, USA, Asien & DACH..."):
             raw = fetch_data("Entertainment")
             if "Error" in raw:
-                st.error(raw)
+                st.error(f"Fehler beim Abruf: {raw}")
             else:
                 cols = ["Datum", "Uhrzeit", "Land", "Genre", "Titel", "Beschreibung", "Sender"]
                 df_ent = process_csv(raw, cols)
