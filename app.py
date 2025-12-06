@@ -3,185 +3,218 @@ import google.generativeai as genai
 import pandas as pd
 from datetime import datetime, timedelta
 import io
+import time
 
 # --- 1. SETUP ---
-st.set_page_config(page_title="Global TV Master", page_icon="🌍", layout="wide")
+st.set_page_config(page_title="Global TV Guide", page_icon="📺", layout="wide")
 
+# API Key laden
 try:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 except Exception:
     st.error("⚠️ API Key fehlt. Bitte in den Streamlit Secrets eintragen.")
     st.stop()
 
-# --- 2. MODELL-AUTO-ERKENNUNG ---
+# --- 2. MODELL CONFIG ---
 @st.cache_resource
-def get_best_model_name():
-    try:
-        # Wir versuchen zuerst das stabilste Modell direkt zu nutzen
-        # (Das Listen der Modelle macht bei manchen Keys Probleme)
-        return "gemini-1.5-flash" 
-    except:
-        return "gemini-pro"
+def get_model():
+    # Wir versuchen, das Flash-Modell zu erzwingen (schnell & gut für Listen)
+    return genai.GenerativeModel('gemini-1.5-flash')
 
-# --- 3. INHALTE ---
-COUNTRIES_ENT = "UK, Deutschland, Österreich, Schweiz, USA, Japan, Südkorea"
+# --- 3. INHALTS-DEFINITIONEN (Deine neue Liste) ---
 
-SPORT_LISTE = """
-FUSSBALL:
-- DE: 1. & 2. Bundesliga, DFB Pokal
-- UK: Premier League, FA Cup
-- ES: La Liga
-- IT: Serie A
-- INT: Champions League, Europa League
-- US: MLS
-
-WINTERSPORT: Ski Alpin, Biathlon.
-MOTOR: Formel 1, MotoGP.
-US-SPORT: NFL, NBA, NHL.
+# TEIL A: FUSSBALL (Die großen Ligen)
+LISTE_FUSSBALL = """
+DEUTSCHLAND: 1. & 2. Bundesliga, DFB Pokal, Frauen-Bundesliga.
+ÖSTERREICH: 1. & 2. Bundesliga, ÖFB Pokal.
+ENGLAND: Premier League, Championship, FA Cup, Carabao Cup, Women's Super League.
+EUROPA (Ligen): La Liga (ES), Serie A (IT), Ligue 1 (FR), Eredivisie (NL), Liga Portugal, Belgian Pro League, Allsvenskan (SE), Süper Lig (TR).
+EUROPA (Pokale): Copa del Rey, Coupe de France, Coppa Italia.
+INTERNATIONAL: Champions League, Europa League, Conference League, Women's CL.
+LÄNDERSPIELE: UEFA & FIFA Länderspiele.
+USA: MLS.
 """
 
-# --- 4. KI ABFRAGE ---
-def get_date_str():
+# TEIL B: MIX (US-Sport, Motor, Tennis, Winter)
+LISTE_MIX = """
+TENNIS: Alle größeren ATP Turniere & Grand Slams (Männer/Frauen).
+WINTERSPORT: Ski Alpin, Biathlon, Skispringen, Langlauf.
+MOTORSPORT: Formel 1, MotoGP.
+US-SPORT: NFL (Football), NBA (Basketball), NHL (Eishockey), MLB (Baseball).
+"""
+
+# TEIL C: ENTERTAINMENT (Länderfokus)
+LISTE_ENT = "UK, Deutschland, Österreich, Schweiz, USA, Japan, Südkorea"
+
+# --- 4. HILFSFUNKTIONEN ---
+
+def get_dates():
     now = datetime.now()
     return now.strftime("%d.%m.%Y"), (now + timedelta(days=1)).strftime("%d.%m.%Y")
 
-@st.cache_data(ttl=3600)
-def fetch_data(category):
-    today, tomorrow = get_date_str()
-    model_name = get_best_model_name()
-    model = genai.GenerativeModel(model_name)
+def clean_csv_line(line):
+    """Hilft, unsaubere Zeilen der KI zu reparieren"""
+    # Entfernt Markdown-Reste am Anfang/Ende der Zeile
+    return line.replace("|", "").strip()
+
+def robust_parse(raw_text_list):
+    """Nimmt eine Liste von Texten (Fußball + Mix) und macht EINE saubere Tabelle"""
+    all_data = []
     
-    # Der Prompt wurde verschärft, damit er weniger "quatscht"
-    if category == "Sport":
+    for raw_text in raw_text_list:
+        if not raw_text or "Error" in raw_text: continue
+        
+        # Grobe Bereinigung
+        clean_text = raw_text.replace("```csv", "").replace("```", "").strip()
+        lines = clean_text.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            
+            # Wir splitten am Semikolon
+            parts = line.split(';')
+            
+            # Validierung: Wir erwarten ca. 6 Spalten
+            # Datum;Uhrzeit;Sportart;Wettbewerb;Paarung/Titel;Sender
+            if len(parts) >= 5:
+                # Zusatz-Check: Beginnt die Zeile mit einer Zahl? (Datum)
+                if len(parts[0]) > 0 and parts[0][0].isdigit():
+                    # Leerzeichen um die Daten bereinigen
+                    clean_parts = [p.strip() for p in parts]
+                    # Wenn Sender fehlt, füllen wir auf
+                    while len(clean_parts) < 6: clean_parts.append("-")
+                    # Wir nehmen nur die ersten 6 Spalten (falls KI mehr liefert)
+                    all_data.append(clean_parts[:6])
+
+    if all_data:
+        cols = ["Datum", "Uhrzeit", "Sportart", "Wettbewerb", "Event / Match", "Sender"]
+        return pd.DataFrame(all_data, columns=cols)
+    else:
+        return pd.DataFrame()
+
+# --- 5. KI ABFRAGE LOGIK ---
+
+def query_gemini(prompt_context, category_mode="Sport"):
+    today, tomorrow = get_dates()
+    model = get_model()
+    
+    if category_mode == "Sport":
         prompt = f"""
-        Du bist eine TV-Datenbank API. Antworte NUR mit Daten.
-        Zeitraum: {today} und {tomorrow}.
+        Rolle: TV-Datenbank. Zeitraum: {today} und {tomorrow}.
         
-        Suche Live-Sport-Events (Fokus: {SPORT_LISTE}).
+        AUFGABE: Suche Live-Events im TV für:
+        {prompt_context}
         
-        FORMAT PFLICHT:
-        - Gebe NUR CSV-Zeilen zurück.
-        - Trennzeichen: Semikolon (;)
-        - Keine Überschriften, keine Einleitung, kein "Hier ist die Liste".
-        - Datumsformat: DD.MM.YYYY
+        REGELN:
+        1. Listung: Jedes Match einzeln. Titel MUSS "Heim vs Gast" sein.
+        2. Sender: Internationale Sender oder DACH-Sender nennen.
+        3. Zeit: Zwingend MEZ.
+        4. WICHTIG: Wenn für eine Liga heute/morgen NICHTS läuft, lass sie weg. Erfinde nichts.
         
-        SPALTEN:
-        Datum;Uhrzeit;Sportart;Wettbewerb;Heim;Gast;Sender
+        FORMAT (CSV):
+        Datum;Uhrzeit;Sportart;Wettbewerb;Heim vs Gast;Sender
+        (Gib mir NUR die CSV-Zeilen, keine Überschriften, kein Markdown).
         """
     else:
         prompt = f"""
-        Du bist eine TV-Datenbank API. Antworte NUR mit Daten.
-        Zeitraum: {today} und {tomorrow}.
-        Fokus: Entertainment, Shows, Reality (UK, US, DE, KR, JP).
+        Rolle: TV-Guide Entertainment. Zeitraum: {today} und {tomorrow}.
+        Fokus Länder: {prompt_context}.
         
-        FORMAT PFLICHT:
-        - Gebe NUR CSV-Zeilen zurück.
-        - Trennzeichen: Semikolon (;)
-        - Keine Überschriften.
+        AUFGABE: Suche nach:
+        - Großen Shows (Prime Time)
+        - Musik/Konzerten
+        - Reality TV Highlights
+        - Exklusiven Dokus
+        (Keine Serien, keine Filme, keine News).
         
-        SPALTEN:
-        Datum;Uhrzeit;Land;Genre;Titel;Beschreibung;Sender
+        FORMAT (CSV):
+        Datum;Uhrzeit;Land;Genre;Titel der Show;Sender
+        (Gib mir NUR die CSV-Zeilen, keine Überschriften, kein Markdown).
         """
-
+    
     try:
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --- 5. ROBUSTER PARSER (Das ist neu!) ---
-def robust_parse_csv(raw_text, expected_columns):
-    """Liest den Text Zeile für Zeile und rettet, was zu retten ist."""
-    
-    # 1. Markdown entfernen
-    clean_text = raw_text.replace("```csv", "").replace("```", "").strip()
-    
-    valid_rows = []
-    lines = clean_text.split('\n')
-    
-    expected_count = len(expected_columns)
-    
-    for line in lines:
-        # Leere Zeilen überspringen
-        if not line.strip(): 
-            continue
-            
-        parts = line.split(';')
-        
-        # Bereinigung: Manchmal macht die KI Leerzeichen um die Semikolons
-        parts = [p.strip() for p in parts]
-        
-        # Prüfung: Hat die Zeile die richtige Anzahl Spalten?
-        if len(parts) == expected_count:
-            # Check: Ist die erste Spalte wirklich ein Datum? (Grobfilter gegen Text)
-            # Wenn die erste Spalte länger als 15 Zeichen ist, ist es wahrscheinlich Gelaber der KI
-            if len(parts[0]) < 20: 
-                valid_rows.append(parts)
-        else:
-            # Fallback: Manchmal nutzt die KI Kommas statt Semikolons
-            parts_comma = line.split(',')
-            if len(parts_comma) == expected_count:
-                valid_rows.append([p.strip() for p in parts_comma])
-    
-    if valid_rows:
-        return pd.DataFrame(valid_rows, columns=expected_columns)
-    else:
-        return pd.DataFrame()
-
 # --- 6. FRONTEND ---
-st.title("🌍 Global Live Guide")
-st.markdown(f"**Daten für:** {get_date_str()[0]} & {get_date_str()[1]}")
 
-tab_sport, tab_ent = st.tabs(["⚽️ SPORT", "🎤 ENTERTAINMENT"])
+st.title("🌍 Mein TV Planer")
+st.caption(f"Daten für {get_dates()[0]} & {get_dates()[1]}")
 
-# === SPORT TAB ===
+tab_sport, tab_ent, tab_debug = st.tabs(["⚽️ SPORT", "🎤 ENTERTAINMENT", "⚙️ DEBUG"])
+
+# === TAB SPORT ===
 with tab_sport:
-    if st.button("Lade Sport", key="s"):
-        with st.spinner("Lade..."):
-            raw = fetch_data("Sport")
+    if st.button("Lade Sport (Fußball & Mix)", key="btn_sport"):
+        with st.spinner("Scanne Fußball-Ligen und Sport-Events..."):
+            # 1. Anfrage Fußball
+            raw_foot = query_gemini(LISTE_FUSSBALL, "Sport")
+            time.sleep(0.5) # Kurze Pause für API
             
-            # Debugging: Wir speichern die Rohdaten, um sie unten anzuzeigen
-            st.session_state['raw_sport'] = raw
+            # 2. Anfrage Rest
+            raw_mix = query_gemini(LISTE_MIX, "Sport")
             
-            if "Error" in raw:
-                st.error(raw)
-            else:
-                cols = ["Datum", "Uhrzeit", "Sportart", "Wettbewerb", "Heim", "Gast", "Sender"]
-                df = robust_parse_csv(raw, cols)
+            # Speichern für Debug
+            st.session_state['dbg_foot'] = raw_foot
+            st.session_state['dbg_mix'] = raw_mix
+            
+            # Verarbeiten
+            df = robust_parse([raw_foot, raw_mix])
+            
+            if not df.empty:
+                # Sortieren nach Uhrzeit
+                try:
+                    df = df.sort_values(by=["Datum", "Uhrzeit"])
+                except:
+                    pass # Falls Sortierung fehlschlägt, egal
                 
-                if not df.empty:
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                else:
-                    st.warning("Keine Tabelle erkannt.")
-                    st.info("Das hat die KI geantwortet (siehe unten bei 'Rohdaten').")
+                st.success(f"{len(df)} Live-Events gefunden.")
+                st.dataframe(
+                    df, 
+                    use_container_width=True, 
+                    hide_index=True,
+                    column_config={
+                        "Event / Match": st.column_config.TextColumn("Paarung", width="large"),
+                        "Wettbewerb": st.column_config.TextColumn("Liga/Turnier", width="medium"),
+                        "Sender": st.column_config.TextColumn("TV", width="medium"),
+                    }
+                )
+            else:
+                st.warning("Keine Daten erkannt. (Vielleicht läuft heute nichts aus deiner Liste?)")
+                st.info("Check den 'DEBUG' Tab für Details.")
 
-# === ENTERTAINMENT TAB ===
+# === TAB ENTERTAINMENT ===
 with tab_ent:
-    if st.button("Lade Shows", key="e"):
-        with st.spinner("Lade..."):
-            raw = fetch_data("Entertainment")
-            st.session_state['raw_ent'] = raw
+    if st.button("Lade Entertainment", key="btn_ent"):
+        with st.spinner("Suche Shows..."):
+            raw_ent = query_gemini(LISTE_ENT, "Entertainment")
+            st.session_state['dbg_ent'] = raw_ent
             
-            if "Error" in raw:
-                st.error(raw)
+            # Parser wiederverwenden (Spaltennamen passen wir gleich an)
+            df = robust_parse([raw_ent])
+            
+            if not df.empty:
+                # Spaltennamen für Ent anpassen (der Parser nutzt Sport-Namen standardmäßig)
+                df.columns = ["Datum", "Uhrzeit", "Land", "Genre", "Titel", "Sender"]
+                st.dataframe(df, use_container_width=True, hide_index=True)
             else:
-                cols = ["Datum", "Uhrzeit", "Land", "Genre", "Titel", "Beschreibung", "Sender"]
-                df = robust_parse_csv(raw, cols)
-                
-                if not df.empty:
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                else:
-                    st.warning("Keine Tabelle erkannt.")
+                st.warning("Keine Daten gefunden.")
 
-# --- 7. DEBUGGING BEREICH ---
-st.divider()
-with st.expander("🛠️ Analyse & Rohdaten (Klick mich bei Fehlern)"):
-    st.write("Falls die Tabelle leer bleibt, siehst du hier, was die KI wirklich gesendet hat:")
+# === TAB DEBUG ===
+with tab_debug:
+    st.write("Hier siehst du, was Google Gemini wirklich geantwortet hat:")
     
-    if 'raw_sport' in st.session_state:
-        st.caption("Letzte Antwort Sport:")
-        st.code(st.session_state['raw_sport'], language='text')
-        
-    if 'raw_ent' in st.session_state:
-        st.caption("Letzte Antwort Entertainment:")
-        st.code(st.session_state['raw_ent'], language='text')
+    if 'dbg_foot' in st.session_state:
+        with st.expander("Rohdaten: Fußball"):
+            st.text(st.session_state['dbg_foot'])
+            
+    if 'dbg_mix' in st.session_state:
+        with st.expander("Rohdaten: Mix Sport"):
+            st.text(st.session_state['dbg_mix'])
+            
+    if 'dbg_ent' in st.session_state:
+        with st.expander("Rohdaten: Entertainment"):
+            st.text(st.session_state['dbg_ent'])
