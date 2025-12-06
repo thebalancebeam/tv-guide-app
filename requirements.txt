@@ -1,5 +1,5 @@
-streamlit>=1.30
-pandas>=2.0
-requests>=2.31
-pytz>=2023
-lxml>=4.9
+streamlit
+pandas
+requests
+pytz
+lxml
