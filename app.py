@@ -6,19 +6,40 @@ from datetime import datetime, timedelta
 from lxml import etree
 import io
 
-st.set_page_config(page_title="TV Guide Debug", layout="wide")
+
+# ----------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------
+
+st.set_page_config(page_title="Global TV Guide", layout="wide")
 
 EPG_SOURCES = {
-    "DE":"https://raw.githubusercontent.com/iptv-org/epg/master/guides/de.xml",
-    "AT":"https://raw.githubusercontent.com/iptv-org/epg/master/guides/at.xml",
-    "CH":"https://raw.githubusercontent.com/iptv-org/epg/master/guides/ch.xml",
-    "UK":"https://raw.githubusercontent.com/iptv-org/epg/master/guides/uk.xml",
-    "US":"https://raw.githubusercontent.com/iptv-org/epg/master/guides/us.xml",
-    "JP":"https://raw.githubusercontent.com/iptv-org/epg/master/guides/jp.xml",
-    "KR":"https://raw.githubusercontent.com/iptv-org/epg/master/guides/kr.xml"
+    "DE": "https://raw.githubusercontent.com/globetvapp/epg/main/Germany/de.xml",
+    "AT": "https://raw.githubusercontent.com/globetvapp/epg/main/Austria/at.xml",
+    "CH": "https://raw.githubusercontent.com/globetvapp/epg/main/Switzerland/ch.xml",
+    "UK": "https://raw.githubusercontent.com/globetvapp/epg/main/UnitedKingdom/uk.xml",
+    "US": "https://raw.githubusercontent.com/globetvapp/epg/main/USA/us.xml",
+    "JP": "https://raw.githubusercontent.com/globetvapp/epg/main/Japan/jp.xml",
+    "KR": "https://raw.githubusercontent.com/globetvapp/epg/main/SouthKorea/kr.xml",
 }
 
-TARGET_TZ = pytz.timezone("Europe/Vienna")
+TZ = pytz.timezone("Europe/Berlin")
+
+
+SPORT_KEYWORDS = [
+    "football","fußball","soccer","cup","liga","champions","uefa",
+    "f1","motogp","tennis","nba","nfl","nhl","mlb","ski","biathlon"
+]
+
+ENT_KEYWORDS = [
+    "show","reality","music","concert","documentary",
+    "talent","event","live","variety","special"
+]
+
+
+# ----------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------
 
 def load_xml(url):
     try:
@@ -26,77 +47,130 @@ def load_xml(url):
         r.raise_for_status()
         return etree.parse(io.BytesIO(r.content))
     except Exception as e:
-        st.warning(f"EPG Fehler bei {url}: {e}")
+        st.warning(f"EPG Fehler → {url} → {e}")
         return None
 
-def parse_epg(tree, country):
-    rows = []
+
+def parse_tree(tree, country):
+    data = []
+
     if tree is None:
         return pd.DataFrame()
+
     for ev in tree.findall(".//programme"):
-        start = ev.get("start")
-        stop = ev.get("stop")
-        title = (ev.findtext("title") or "").strip()
-        # description optional
-        desc = (ev.findtext("desc") or "").strip()
-        channel = ev.get("channel","")
         try:
-            dt_s = datetime.strptime(start[:14], "%Y%m%d%H%M%S")
-            dt_e = datetime.strptime(stop[:14],  "%Y%m%d%H%M%S")
-            dt_s = pytz.UTC.localize(dt_s).astimezone(TARGET_TZ)
-            dt_e = pytz.UTC.localize(dt_e).astimezone(TARGET_TZ)
-        except Exception:
+            start = ev.get("start")
+            end   = ev.get("stop")
+
+            ts = datetime.strptime(start[:14], "%Y%m%d%H%M%S")
+            te = datetime.strptime(end[:14],   "%Y%m%d%H%M%S")
+
+            ts = pytz.UTC.localize(ts).astimezone(TZ)
+            te = pytz.UTC.localize(te).astimezone(TZ)
+
+            data.append({
+                "country": country,
+                "channel": ev.get("channel"),
+                "title": (ev.findtext("title") or "").strip(),
+                "description": (ev.findtext("desc") or "").strip(),
+                "start": ts,
+                "end": te
+            })
+
+        except:
             continue
-        rows.append({
-            "country": country,
-            "channel": channel,
-            "title": title,
-            "description": desc,
-            "start": dt_s,
-            "end": dt_e
-        })
-    return pd.DataFrame(rows)
+
+    return pd.DataFrame(data)
+
+
+
+# ----------------------------------------------------------
+# Load + cache
+# ----------------------------------------------------------
 
 @st.cache_data(ttl=600)
-def load_all_epg():
+def load_all():
     dfs = []
-    stats = []
-    for c, url in EPG_SOURCES.items():
-        tree = load_xml(url)
-        df = parse_epg(tree, c)
-        stats.append((c, url, len(df)))
-        dfs.append(df)
-    if dfs:
-        return pd.concat(dfs, ignore_index=True), stats
-    else:
-        return pd.DataFrame(), stats
+    for c,u in EPG_SOURCES.items():
+        dfs.append(parse_tree(load_xml(u), c))
 
-st.header("🌐 EPG Debug Übersicht")
-df_all, stats = load_all_epg()
-for c, url, cnt in stats:
-    st.write(f"Quelle {c}: {url} → Programme gefunden: {cnt}")
+    if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True)
 
-if df_all.empty:
-    st.error("⚠️ Keine EPG-Daten insgesamt geladen.")
+
+
+# ----------------------------------------------------------
+# Filters
+# ----------------------------------------------------------
+
+def is_sport(t):
+    t = (t or "").lower()
+    return any(w in t for w in SPORT_KEYWORDS)
+
+def is_entertainment(t):
+    t = (t or "").lower()
+    return any(w in t for w in ENT_KEYWORDS)
+
+
+
+# ----------------------------------------------------------
+# UI
+# ----------------------------------------------------------
+
+st.title("📺 Global TV Guide (EPG only)")
+
+df = load_all()
+
+if df.empty:
+    st.error("Keine EPG Daten geladen.")
     st.stop()
 
-st.write("Erste 20 Programme (unabhängig vom Zeitfenster):")
-st.dataframe(df_all.head(20))
 
-# Zeitfilter
-now = datetime.now(TARGET_TZ)
+now = datetime.now(TZ)
 end = now + timedelta(hours=24)
-df_24 = df_all[(df_all["start"] >= now) & (df_all["start"] <= end)]
 
-st.write(f"Programme in nächster 24h: {len(df_24)}")
-st.dataframe(df_24.head(20))
+df_24 = df[(df.start >= now) & (df.start <= end)]
 
-# Weiterer Filter (z. B. Entertainment)
-df_ent = df_24[~df_24["title"].str.contains("Sport|News|Film|Serie|Thriller|Drama", case=False, na=False)]
-st.write("Entertainment (gefiltert):")
-st.dataframe(df_ent.head(20))
+st.write(f"Zeitraum: **{now} bis {end}**")
+st.write(f"Alle Events: {len(df_24)}")
 
-# Sport-Filter
-df_sport = df_24[df_24["title"].str.contains("Sport|Cup|Liga|UEFA|Champions|Football|Soccer", case=False, na=False)]
-st.write("Sport (gefiltert):")
-st.dataframe(df_sport.head(20))
+tab_sport, tab_ent, tab_debug = st.tabs(["⚽ Sport", "🎭 Entertainment", "🛠 Debug"])
+
+
+
+# ----------------------------------------------------------
+# SPORT
+# ----------------------------------------------------------
+with tab_sport:
+    s = df_24[df_24.title.apply(is_sport)]
+
+    if s.empty:
+        st.warning("Keine Sport Events gefunden.")
+    else:
+        st.dataframe(s.sort_values("start"), use_container_width=True)
+
+
+
+# ----------------------------------------------------------
+# ENTERTAINMENT
+# ----------------------------------------------------------
+with tab_ent:
+    e = df_24[df_24.title.apply(is_entertainment)]
+
+    if e.empty:
+        st.warning("Keine Entertainment Events gefunden.")
+    else:
+        st.dataframe(e.sort_values("start"), use_container_width=True)
+
+
+
+# ----------------------------------------------------------
+# DEBUG
+# ----------------------------------------------------------
+with tab_debug:
+    st.subheader("Alle rohen Events")
+    st.dataframe(df.head(200))
+
+    st.subheader("24h Events")
+    st.dataframe(df_24.head(200))
