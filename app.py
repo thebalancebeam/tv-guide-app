@@ -15,58 +15,69 @@ except Exception:
     st.error("⚠️ API Key fehlt. Bitte in den Streamlit Secrets eintragen.")
     st.stop()
 
-# --- 2. DIE MODELL-LISTE (Brute Force) ---
-# Wir probieren diese Modelle nacheinander durch, bis eines antwortet.
-MODEL_CANDIDATES = [
-    "gemini-1.5-flash",       # Der Schnellste (Alias)
-    "gemini-1.5-flash-001",   # Der Schnellste (Versioniert)
-    "gemini-1.5-flash-latest",# Manchmal dieser Name
-    "gemini-1.5-pro",         # Der Starke
-    "gemini-pro"              # Der Klassiker (1.0) - Fallback, der fast immer geht
-]
+# --- 2. DIE LÖSUNG: DYNAMISCHE MODELL-SUCHE ---
+@st.cache_resource
+def get_working_model():
+    """
+    Fragt Google: 'Welche Modelle hast du für mich?'
+    und nimmt das erste, das Text generieren kann.
+    """
+    status_text = []
+    try:
+        # Wir fragen die API direkt nach der Liste
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        
+        if not available_models:
+            return None, "Keine Modelle gefunden. API Key prüfen."
 
-def query_gemini_safe(prompt_text):
-    """Probiert alle Modell-Namen durch, bis einer klappt."""
-    last_error = ""
-    
-    for model_name in MODEL_CANDIDATES:
-        try:
-            # Versuch mit aktuellem Modellnamen
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt_text)
-            return response.text # Erfolg! Sofort zurückgeben.
+        # Wir suchen bevorzugt nach Flash oder Pro
+        chosen_model = None
+        
+        # Priorität 1: Flash (schnell)
+        for m in available_models:
+            if "flash" in m:
+                chosen_model = m
+                break
+        
+        # Priorität 2: Pro (stark)
+        if not chosen_model:
+            for m in available_models:
+                if "pro" in m:
+                    chosen_model = m
+                    break
+        
+        # Fallback: Einfach das erste nehmen
+        if not chosen_model:
+            chosen_model = available_models[0]
             
-        except Exception as e:
-            # Fehler speichern und weitermachen
-            last_error = str(e)
-            continue # Nächster Modellname in der Liste
-            
-    # Wenn wir hier ankommen, haben alle Modelle versagt
-    return f"Error: Alle Modelle fehlgeschlagen. Letzter Fehler: {last_error}"
+        return genai.GenerativeModel(chosen_model), f"✅ Verbunden mit: {chosen_model}"
+
+    except Exception as e:
+        return None, f"❌ Kritischer Fehler bei Modellsuche: {str(e)}"
+
+# Modell initialisieren
+model, model_status = get_working_model()
 
 # --- 3. INHALTS-DEFINITIONEN ---
 
-# TEIL A: FUSSBALL
 LISTE_FUSSBALL = """
 DEUTSCHLAND: 1. & 2. Bundesliga, DFB Pokal.
 ÖSTERREICH: 1. & 2. Bundesliga, ÖFB Pokal.
-ENGLAND: Premier League, Championship, FA Cup, Carabao Cup.
-EUROPA LIGEN: La Liga, Serie A, Ligue 1, Eredivisie, Liga Portugal, Süper Lig.
-POKALE: Copa del Rey, Coupe de France, Coppa Italia.
-INTERNATIONAL: Champions League, Europa League, Conference League.
-USA: MLS.
+ENGLAND: Premier League, Championship, FA Cup.
+EUROPA: La Liga, Serie A, Ligue 1, Champions League, Europa League.
 """
 
-# TEIL B: MIX (Restliche Sportarten)
 LISTE_MIX = """
-TENNIS: ATP Turniere & Grand Slams.
-WINTER: Ski Alpin, Biathlon, Skispringen.
+TENNIS: Grand Slams & ATP.
+WINTER: Ski Alpin, Biathlon.
 MOTOR: Formel 1, MotoGP.
-US-SPORT: NFL, NBA, NHL, MLB.
+US-SPORT: NFL, NBA, NHL.
 """
 
-# TEIL C: ENTERTAINMENT
-LISTE_ENT = "UK, Deutschland, Österreich, USA, Japan, Südkorea"
+LISTE_ENT = "UK, Deutschland, USA (Shows, Musik, Reality)"
 
 # --- 4. HILFSFUNKTIONEN ---
 
@@ -75,122 +86,99 @@ def get_dates():
     return now.strftime("%d.%m.%Y"), (now + timedelta(days=1)).strftime("%d.%m.%Y")
 
 def robust_parse(raw_text_list):
-    """Macht aus Text-Schnipseln eine Tabelle"""
     all_data = []
-    
     for raw_text in raw_text_list:
         if not raw_text or "Error" in raw_text: continue
-        
         clean_text = raw_text.replace("```csv", "").replace("```", "").strip()
         lines = clean_text.split('\n')
-        
         for line in lines:
-            line = line.strip()
-            if not line: continue
-            
-            # Semikolon Split
+            if not line.strip(): continue
             parts = line.split(';')
-            
-            # Validierung: Mindestens 4-5 Spalten
-            if len(parts) >= 4:
-                # Datum Check (Erste Spalte muss Zahl enthalten)
-                if len(parts[0]) > 0 and any(char.isdigit() for char in parts[0]):
-                    clean_parts = [p.strip() for p in parts]
-                    # Auffüllen auf 6 Spalten
-                    while len(clean_parts) < 6: clean_parts.append("-")
-                    all_data.append(clean_parts[:6])
-
+            if len(parts) >= 4 and len(parts[0]) > 0 and any(c.isdigit() for c in parts[0]):
+                clean_parts = [p.strip() for p in parts]
+                while len(clean_parts) < 6: clean_parts.append("-")
+                all_data.append(clean_parts[:6])
+                
     if all_data:
-        cols = ["Datum", "Uhrzeit", "Sportart", "Wettbewerb", "Event / Match", "Sender"]
+        cols = ["Datum", "Uhrzeit", "Sportart", "Wettbewerb", "Event", "Sender"]
         return pd.DataFrame(all_data, columns=cols)
     else:
         return pd.DataFrame()
 
+def run_query(prompt_context, mode="Sport"):
+    if not model:
+        return "Error: Kein Modell verfügbar."
+    
+    today, tomorrow = get_dates()
+    
+    if mode == "Sport":
+        prompt = f"""
+        Rolle: TV-Datenbank. Zeitraum: {today} und {tomorrow}.
+        AUFGABE: Suche Live-Events für: {prompt_context}
+        FORMAT: NUR CSV (Semikolon getrennt).
+        Spalten: Datum;Uhrzeit;Sportart;Wettbewerb;Heim vs Gast;Sender
+        """
+    else:
+        prompt = f"""
+        Rolle: TV-Guide. Zeitraum: {today} und {tomorrow}.
+        Länder: {prompt_context}. Suche: Prime-Time Shows, Reality.
+        FORMAT: NUR CSV (Semikolon getrennt).
+        Spalten: Datum;Uhrzeit;Land;Genre;Titel;Sender
+        """
+        
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Error: {str(e)}"
+
 # --- 5. FRONTEND ---
 
 st.title("🌍 Mein TV Planer")
-st.caption(f"Daten für {get_dates()[0]} & {get_dates()[1]}")
+st.caption(model_status) # Zeigt oben an, welches Modell gefunden wurde!
+
+if not model:
+    st.error("Die App konnte keine Verbindung zu Google herstellen. Siehe Status oben.")
+    st.stop()
 
 tab_sport, tab_ent, tab_debug = st.tabs(["⚽️ SPORT", "🎤 ENTERTAINMENT", "⚙️ DEBUG"])
 
-# === SPORT TAB ===
+# === SPORT ===
 with tab_sport:
-    if st.button("Lade Sport-Programm", key="btn_sport"):
-        with st.spinner("Scanne Sport-Kanäle (probiere verschiedene KI-Modelle)..."):
+    if st.button("Lade Sport", key="btn_sport"):
+        with st.spinner("Lade Daten..."):
+            raw_foot = run_query(LISTE_FUSSBALL, "Sport")
+            time.sleep(1)
+            raw_mix = run_query(LISTE_MIX, "Sport")
             
-            # Prompt bauen
-            today, tomorrow = get_dates()
-            base_prompt = f"""
-            Rolle: TV-Datenbank. Zeitraum: {today} und {tomorrow}.
-            AUFGABE: Suche Live-Events. 
-            Regeln: NUR CSV. Trennzeichen Semikolon (;). Spalten: Datum;Uhrzeit;Sportart;Wettbewerb;Heim vs Gast;Sender.
-            Keine Markdown-Blöcke. Zeit in MEZ.
-            Suche nach: """
+            st.session_state['d_foot'] = raw_foot
+            st.session_state['d_mix'] = raw_mix
             
-            # 1. Anfrage Fußball
-            raw_foot = query_gemini_safe(base_prompt + LISTE_FUSSBALL)
-            time.sleep(0.5)
-            
-            # 2. Anfrage Rest
-            raw_mix = query_gemini_safe(base_prompt + LISTE_MIX)
-            
-            # Debug speichern
-            st.session_state['dbg_foot'] = raw_foot
-            st.session_state['dbg_mix'] = raw_mix
-            
-            # Tabelle bauen
             df = robust_parse([raw_foot, raw_mix])
             
             if not df.empty:
-                try:
-                    df = df.sort_values(by=["Datum", "Uhrzeit"])
-                except:
-                    pass
-                
-                st.success(f"{len(df)} Live-Events geladen.")
-                st.dataframe(
-                    df, 
-                    use_container_width=True, 
-                    hide_index=True,
-                    column_config={
-                        "Event / Match": st.column_config.TextColumn("Paarung", width="large"),
-                        "Wettbewerb": st.column_config.TextColumn("Liga", width="medium"),
-                    }
-                )
+                try: df = df.sort_values(by=["Datum", "Uhrzeit"])
+                except: pass
+                st.dataframe(df, use_container_width=True, hide_index=True)
             else:
-                st.warning("Keine Daten erkannt.")
-                st.info("Falls Fehler 404 auftauchte, wurde er jetzt automatisch umgangen. Wenn trotzdem keine Daten da sind, hat die KI keine Events gefunden.")
+                st.warning("Keine Daten gefunden.")
 
-# === ENTERTAINMENT TAB ===
+# === ENTERTAINMENT ===
 with tab_ent:
     if st.button("Lade Entertainment", key="btn_ent"):
-        with st.spinner("Scanne Shows..."):
-            today, tomorrow = get_dates()
-            prompt_ent = f"""
-            Rolle: TV-Guide. Zeitraum: {today} und {tomorrow}.
-            Länder: {LISTE_ENT}.
-            Suche: Prime-Time Shows, Musik, Reality. KEINE Filme/Serien.
-            Format: NUR CSV. Trennzeichen Semikolon (;).
-            Spalten: Datum;Uhrzeit;Land;Genre;Titel;Sender.
-            """
-            
-            raw_ent = query_gemini_safe(prompt_ent)
-            st.session_state['dbg_ent'] = raw_ent
+        with st.spinner("Lade Shows..."):
+            raw_ent = run_query(LISTE_ENT, "Ent")
+            st.session_state['d_ent'] = raw_ent
             
             df = robust_parse([raw_ent])
-            
             if not df.empty:
                 df.columns = ["Datum", "Uhrzeit", "Land", "Genre", "Titel", "Sender"]
                 st.dataframe(df, use_container_width=True, hide_index=True)
             else:
                 st.warning("Keine Daten gefunden.")
 
-# === DEBUG TAB ===
+# === DEBUG ===
 with tab_debug:
-    st.write("Rohdaten der KI:")
-    if 'dbg_foot' in st.session_state:
-        with st.expander("Fußball Raw"): st.text(st.session_state['dbg_foot'])
-    if 'dbg_mix' in st.session_state:
-        with st.expander("Mix Sport Raw"): st.text(st.session_state['dbg_mix'])
-    if 'dbg_ent' in st.session_state:
-        with st.expander("Entertainment Raw"): st.text(st.session_state['dbg_ent'])
+    if 'd_foot' in st.session_state: st.text(st.session_state['d_foot'])
+    if 'd_mix' in st.session_state: st.text(st.session_state['d_mix'])
+    if 'd_ent' in st.session_state: st.text(st.session_state['d_ent'])
