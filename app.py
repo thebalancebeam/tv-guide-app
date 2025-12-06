@@ -6,78 +6,41 @@ import io
 import time
 
 # --- 1. SETUP ---
-st.set_page_config(page_title="Global TV Guide", page_icon="📺", layout="wide")
+st.set_page_config(page_title="Global TV Guide", page_icon="🌍", layout="wide")
 
-# API Key laden
 try:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 except Exception:
     st.error("⚠️ API Key fehlt. Bitte in den Streamlit Secrets eintragen.")
     st.stop()
 
-# --- 2. DIE LÖSUNG: DYNAMISCHE MODELL-SUCHE ---
+# --- 2. MODELL-SUCHE ---
 @st.cache_resource
-def get_working_model():
-    """
-    Fragt Google: 'Welche Modelle hast du für mich?'
-    und nimmt das erste, das Text generieren kann.
-    """
-    status_text = []
-    try:
-        # Wir fragen die API direkt nach der Liste
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
-        
-        if not available_models:
-            return None, "Keine Modelle gefunden. API Key prüfen."
-
-        # Wir suchen bevorzugt nach Flash oder Pro
-        chosen_model = None
-        
-        # Priorität 1: Flash (schnell)
-        for m in available_models:
-            if "flash" in m:
-                chosen_model = m
-                break
-        
-        # Priorität 2: Pro (stark)
-        if not chosen_model:
-            for m in available_models:
-                if "pro" in m:
-                    chosen_model = m
-                    break
-        
-        # Fallback: Einfach das erste nehmen
-        if not chosen_model:
-            chosen_model = available_models[0]
-            
-        return genai.GenerativeModel(chosen_model), f"✅ Verbunden mit: {chosen_model}"
-
-    except Exception as e:
-        return None, f"❌ Kritischer Fehler bei Modellsuche: {str(e)}"
-
-# Modell initialisieren
-model, model_status = get_working_model()
+def get_model():
+    # Wir nehmen Flash, da es schnell ist und Search Grounding unterstützt
+    # Wir definieren das Modell hier, aber das Tool aktivieren wir beim Aufruf
+    return genai.GenerativeModel('gemini-1.5-flash')
 
 # --- 3. INHALTS-DEFINITIONEN ---
 
 LISTE_FUSSBALL = """
-DEUTSCHLAND: 1. & 2. Bundesliga, DFB Pokal.
-ÖSTERREICH: 1. & 2. Bundesliga, ÖFB Pokal.
-ENGLAND: Premier League, Championship, FA Cup.
-EUROPA: La Liga, Serie A, Ligue 1, Champions League, Europa League.
+Suche den exakten Spielplan für HEUTE und MORGEN für:
+DEUTSCHLAND: 1. Bundesliga, 2. Bundesliga.
+ENGLAND: Premier League, Championship.
+EUROPA: La Liga (Spanien), Serie A (Italien), Ligue 1 (Frankreich).
 """
 
 LISTE_MIX = """
-TENNIS: Grand Slams & ATP.
-WINTER: Ski Alpin, Biathlon.
-MOTOR: Formel 1, MotoGP.
-US-SPORT: NFL, NBA, NHL.
+Suche den exakten Zeitplan für HEUTE und MORGEN für:
+WINTERSPORT: Ski Alpin Weltcup, Biathlon Weltcup (Orte & Zeiten).
+MOTORSPORT: Formel 1 (Nur wenn Rennwochenende ist), MotoGP.
+US-SPORT: NFL, NBA, NHL (Nur Spiele, die in MEZ heute/morgen laufen).
 """
 
-LISTE_ENT = "UK, Deutschland, USA (Shows, Musik, Reality)"
+LISTE_ENT = """
+Suche das TV-Programm (Prime Time 20:15) für HEUTE und MORGEN in Deutschland, UK und USA.
+Fokus: Große Shows, Live-Events, Reality-TV Highlights.
+"""
 
 # --- 4. HILFSFUNKTIONEN ---
 
@@ -89,88 +52,115 @@ def robust_parse(raw_text_list):
     all_data = []
     for raw_text in raw_text_list:
         if not raw_text or "Error" in raw_text: continue
+        
+        # Markdown entfernen
         clean_text = raw_text.replace("```csv", "").replace("```", "").strip()
         lines = clean_text.split('\n')
+        
         for line in lines:
             if not line.strip(): continue
             parts = line.split(';')
-            if len(parts) >= 4 and len(parts[0]) > 0 and any(c.isdigit() for c in parts[0]):
-                clean_parts = [p.strip() for p in parts]
-                while len(clean_parts) < 6: clean_parts.append("-")
-                all_data.append(clean_parts[:6])
+            
+            # Wir akzeptieren Zeilen, die wie Daten aussehen (mind. 4 Spalten)
+            if len(parts) >= 4:
+                # Datum-Check (erste Spalte sollte Zahl enthalten)
+                if len(parts[0]) > 0 and any(c.isdigit() for c in parts[0]):
+                    clean_parts = [p.strip() for p in parts]
+                    # Auffüllen auf 6 Spalten falls Sender fehlt
+                    while len(clean_parts) < 6: clean_parts.append("-")
+                    all_data.append(clean_parts[:6])
                 
     if all_data:
-        cols = ["Datum", "Uhrzeit", "Sportart", "Wettbewerb", "Event", "Sender"]
+        cols = ["Datum", "Uhrzeit", "Sportart", "Wettbewerb", "Event / Match", "Sender"]
         return pd.DataFrame(all_data, columns=cols)
     else:
         return pd.DataFrame()
 
-def run_query(prompt_context, mode="Sport"):
-    if not model:
-        return "Error: Kein Modell verfügbar."
-    
+def run_query_with_search(prompt_context, mode="Sport"):
+    model = get_model()
     today, tomorrow = get_dates()
     
-    if mode == "Sport":
-        prompt = f"""
-        Rolle: TV-Datenbank. Zeitraum: {today} und {tomorrow}.
-        AUFGABE: Suche Live-Events für: {prompt_context}
-        FORMAT: NUR CSV (Semikolon getrennt).
-        Spalten: Datum;Uhrzeit;Sportart;Wettbewerb;Heim vs Gast;Sender
-        """
-    else:
-        prompt = f"""
-        Rolle: TV-Guide. Zeitraum: {today} und {tomorrow}.
-        Länder: {prompt_context}. Suche: Prime-Time Shows, Reality.
-        FORMAT: NUR CSV (Semikolon getrennt).
-        Spalten: Datum;Uhrzeit;Land;Genre;Titel;Sender
-        """
-        
+    # Der Prompt zwingt die KI jetzt zur Recherche
+    base_prompt = f"""
+    Du bist ein Echtzeit-TV-Guide. Nutze Google Search, um die aktuellen Daten zu finden.
+    Datum heute: {today}. Zeitraum: {today} und {tomorrow}.
+    
+    AUFGABE:
+    Recherchiere die genauen Ansetzungen und TV-Sender für:
+    {prompt_context}
+    
+    WICHTIGSTE REGEL: 
+    - Nenne NUR Events, die wirklich heute oder morgen stattfinden.
+    - Wenn eine Liga pausiert (z.B. Winterpause), lass sie weg. Erfinde NICHTS.
+    - Uhrzeiten zwingend in MEZ.
+    
+    FORMAT:
+    Gib mir das Ergebnis NUR als CSV (Semikolon getrennt).
+    Spalten: Datum;Uhrzeit;Sportart;Wettbewerb;Heim vs Gast (oder Titel);Sender
+    """
+    
     try:
-        response = model.generate_content(prompt)
+        # HIER IST DER FIX: tools='google_search_retrieval'
+        # Das zwingt Gemini, im Internet nachzusehen!
+        response = model.generate_content(
+            base_prompt,
+            tools='google_search_retrieval'
+        )
         return response.text
     except Exception as e:
+        # Fallback, falls Search Tool nicht verfügbar ist (passiert bei manchen Keys)
         return f"Error: {str(e)}"
 
 # --- 5. FRONTEND ---
 
-st.title("🌍 Mein TV Planer")
-st.caption(model_status) # Zeigt oben an, welches Modell gefunden wurde!
-
-if not model:
-    st.error("Die App konnte keine Verbindung zu Google herstellen. Siehe Status oben.")
-    st.stop()
+st.title("🌍 Mein Live TV Planer (Echtzeit)")
+st.caption(f"Datenabruf via Google Search Grounding | {get_dates()[0]}")
 
 tab_sport, tab_ent, tab_debug = st.tabs(["⚽️ SPORT", "🎤 ENTERTAINMENT", "⚙️ DEBUG"])
 
 # === SPORT ===
 with tab_sport:
-    if st.button("Lade Sport", key="btn_sport"):
-        with st.spinner("Lade Daten..."):
-            raw_foot = run_query(LISTE_FUSSBALL, "Sport")
-            time.sleep(1)
-            raw_mix = run_query(LISTE_MIX, "Sport")
+    if st.button("Lade Sport (Live Check)", key="btn_sport"):
+        with st.spinner("Recherchiere im Internet nach aktuellen Spielen..."):
             
-            st.session_state['d_foot'] = raw_foot
-            st.session_state['d_mix'] = raw_mix
+            # 1. Fußball
+            raw_foot = run_query_with_search(LISTE_FUSSBALL, "Sport")
+            # 2. Mix
+            raw_mix = run_query_with_search(LISTE_MIX, "Sport")
+            
+            st.session_state['df_foot'] = raw_foot
+            st.session_state['df_mix'] = raw_mix
             
             df = robust_parse([raw_foot, raw_mix])
             
             if not df.empty:
+                # Sortieren
                 try: df = df.sort_values(by=["Datum", "Uhrzeit"])
                 except: pass
-                st.dataframe(df, use_container_width=True, hide_index=True)
+                
+                st.success(f"{len(df)} bestätigte Live-Events gefunden.")
+                st.dataframe(
+                    df, 
+                    use_container_width=True, 
+                    hide_index=True,
+                    column_config={
+                        "Event / Match": st.column_config.TextColumn("Paarung", width="large"),
+                        "Wettbewerb": st.column_config.TextColumn("Liga", width="medium"),
+                    }
+                )
             else:
-                st.warning("Keine Daten gefunden.")
+                st.warning("Keine Events gefunden. (Oder die Google Suche war nicht erreichbar).")
+                st.info("Tipp: Wenn hier nichts steht, findet Google für heute keine Spiele in den genannten Ligen.")
 
 # === ENTERTAINMENT ===
 with tab_ent:
-    if st.button("Lade Entertainment", key="btn_ent"):
-        with st.spinner("Lade Shows..."):
-            raw_ent = run_query(LISTE_ENT, "Ent")
-            st.session_state['d_ent'] = raw_ent
+    if st.button("Lade Entertainment (Live Check)", key="btn_ent"):
+        with st.spinner("Recherchiere TV-Programm..."):
+            raw_ent = run_query_with_search(LISTE_ENT, "Ent")
+            st.session_state['df_ent'] = raw_ent
             
             df = robust_parse([raw_ent])
+            
             if not df.empty:
                 df.columns = ["Datum", "Uhrzeit", "Land", "Genre", "Titel", "Sender"]
                 st.dataframe(df, use_container_width=True, hide_index=True)
@@ -179,6 +169,7 @@ with tab_ent:
 
 # === DEBUG ===
 with tab_debug:
-    if 'd_foot' in st.session_state: st.text(st.session_state['d_foot'])
-    if 'd_mix' in st.session_state: st.text(st.session_state['d_mix'])
-    if 'd_ent' in st.session_state: st.text(st.session_state['d_ent'])
+    st.write("Rohdaten der KI (mit Search Grounding):")
+    if 'df_foot' in st.session_state: st.text(st.session_state['df_foot'])
+    if 'df_mix' in st.session_state: st.text(st.session_state['df_mix'])
+    if 'df_ent' in st.session_state: st.text(st.session_state['df_ent'])
