@@ -1,228 +1,166 @@
 import streamlit as st
 import pandas as pd
 import requests
+import google.generativeai as genai
 from datetime import datetime, timedelta
+import pytz
+import time
 
 # --- KONFIGURATION ---
-st.set_page_config(page_title="Pure API TV Guide", page_icon="📡", layout="wide")
+st.set_page_config(page_title="Hybrid TV Guide", page_icon="⚽️", layout="wide")
 
-# TheSportsDB API Konfiguration (Public Test Key "3")
-TSDB_BASE = "https://www.thesportsdb.com/api/v1/json/3"
+# 1. API KEYS
+FOOTBALL_DATA_KEY = "a1d1af300332400287c7765a19b34c01" # Dein Key
 
-# WICHTIG: Die IDs der Ligen in der TheSportsDB Datenbank
-# Wir beschränken uns auf deine Wunschliste.
-LEAGUE_MAP = {
-    # FUSSBALL
-    "🇩🇪 Bundesliga": "4331",
-    "🇩🇪 2. Bundesliga": "4332",
-    "🇦🇹 Bundesliga": "4333",
-    "🇬🇧 Premier League": "4328",
-    "🇪🇸 La Liga": "4335",
-    "🇮🇹 Serie A": "4337",
-    "🇫🇷 Ligue 1": "4334",
-    # MOTORSPORT
-    "🏎️ Formel 1": "4370",
-    "🏍️ MotoGP": "4392",
-    # WINTERSPORT (IDs können im Test-Key variieren, wir versuchen die Standard-IDs)
-    "🎿 Ski Alpin (Men)": "4403",
-    "🎿 Ski Alpin (Women)": "4404",
-    "🎯 Biathlon": "4410"
+# Google API Key aus Secrets laden
+try:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+except Exception:
+    st.error("⚠️ Google Gemini API Key fehlt in den Streamlit Secrets.")
+    st.stop()
+
+# 2. DEFINITIONEN
+HEADERS = {'X-Auth-Token': FOOTBALL_DATA_KEY}
+MEZ = pytz.timezone('Europe/Berlin')
+
+LEAGUES = {
+    "🇩🇪 Bundesliga": "BL1",
+    "🇩🇪 2. Bundesliga": "BL2",
+    "🇬🇧 Premier League": "PL",
+    "🇪🇺 Champions League": "CL",
+    "🇪🇸 La Liga": "PD",
+    "🇮🇹 Serie A": "SA",
+    "🇫🇷 Ligue 1": "FL1"
 }
 
 # --- FUNKTIONEN ---
 
-def get_dates():
-    """Gibt heute und morgen als Datumsobjekte zurück"""
-    today = datetime.now().date()
-    tomorrow = today + timedelta(days=1)
-    return today, tomorrow
-
-def fetch_sports_schedule():
+def get_confirmed_matches():
     """
-    Fragt TheSportsDB für jede Liga ab.
-    Endpunkt: eventsnextleague.php (Liefert die nächsten 15 Events einer Liga)
+    Holt den Spielplan von football-data.org (Die 'Wahrheit').
     """
-    today, tomorrow = get_dates()
-    all_events = []
+    today = datetime.now().strftime("%Y-%m-%d")
+    next_days = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d") # Heute + Morgen
     
-    # Ladebalken für User-Feedback
-    progress_text = "Lade Ligen..."
-    my_bar = st.progress(0, text=progress_text)
-    total = len(LEAGUE_MAP)
+    all_matches_text = []
     
-    for i, (league_name, league_id) in enumerate(LEAGUE_MAP.items()):
-        url = f"{TSDB_BASE}/eventsnextleague.php?id={league_id}"
+    # Progress Bar für API Abruf
+    bar = st.progress(0, text="Hole offiziellen Spielplan...")
+    
+    for i, (name, code) in enumerate(LEAGUES.items()):
+        url = f"https://api.football-data.org/v4/competitions/{code}/matches?dateFrom={today}&dateTo={next_days}"
         
         try:
-            r = requests.get(url, timeout=3)
-            data = r.json()
-            
-            if data and "events" in data and data["events"]:
-                for e in data["events"]:
-                    # Datum parsen (Format YYYY-MM-DD)
-                    date_str = e.get("dateEvent", "")
-                    if not date_str: continue
+            r = requests.get(url, headers=HEADERS, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                matches = data.get("matches", [])
+                
+                for m in matches:
+                    # Zeit umrechnen
+                    utc_dt = datetime.strptime(m["utcDate"], "%Y-%m-%dT%H:%M:%SZ")
+                    mez_dt = utc_dt.replace(tzinfo=pytz.utc).astimezone(MEZ)
                     
-                    try:
-                        event_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-                    except:
-                        continue
-                        
-                    # FILTER: Ist das Event heute oder morgen?
-                    if event_date == today or event_date == tomorrow:
-                        
-                        # Uhrzeit sauber machen (nur HH:MM)
-                        time_str = e.get("strTime", "00:00")[:5]
-                        
-                        # TV Sender Logik
-                        # TheSportsDB hat ein Feld 'strTVStation'. Das ist oft leer oder international.
-                        tv_stations = e.get("strTVStation")
-                        if not tv_stations:
-                            tv_stations = "k.A."
-                        
-                        all_events.append({
-                            "Datum": event_date.strftime("%d.%m.%Y"),
-                            "Uhrzeit": time_str,
-                            "Sportart": e.get("strSport", "Sport"),
-                            "Wettbewerb": league_name,
-                            "Paarung / Event": e.get("strEvent", e.get("strEventAlternate", "Event")),
-                            "Sender (Info)": tv_stations
-                        })
-                        
-        except Exception as err:
-            print(f"Fehler bei {league_name}: {err}")
-            
-        # Balken aktualisieren
-        my_bar.progress((i + 1) / total, text=f"Lade {league_name}...")
+                    if m["status"] in ["SCHEDULED", "TIMED", "IN_PLAY"]:
+                        # Wir bauen einen String für die KI
+                        match_str = f"{mez_dt.strftime('%d.%m. %H:%M')} | {name} | {m['homeTeam']['shortName']} vs {m['awayTeam']['shortName']}"
+                        all_matches_text.append(match_str)
+            else:
+                print(f"Fehler bei {name}: {r.status_code}")
+                
+        except Exception as e:
+            print(f"API Fehler: {e}")
         
-    my_bar.empty()
-    return pd.DataFrame(all_events)
+        bar.progress((i + 1) / len(LEAGUES))
+        
+    bar.empty()
+    return all_matches_text
 
-def fetch_entertainment_schedule(country_code, country_name):
+def enrich_with_google(match_list_text):
     """
-    Fragt TVMaze API ab.
-    Endpunkt: /schedule (Liefert das komplette Tagesprogramm eines Landes)
+    Nimmt die Liste der Spiele und lässt Google die Sender suchen.
     """
-    today, _ = get_dates() # TVMaze Free erlaubt Batch meist nur für einen Tag
-    date_str = today.strftime("%Y-%m-%d")
+    # Wir nehmen das Flash Modell (schnell & unterstützt Search)
+    model = genai.GenerativeModel('gemini-1.5-flash')
     
-    url = f"https://api.tvmaze.com/schedule?country={country_code}&date={date_str}"
+    # Wir machen aus der Liste einen einzigen Textblock
+    matches_context = "\n".join(match_list_text)
+    
+    prompt = f"""
+    Du bist ein TV-Guide-Assistent. Ich gebe dir eine Liste von OFFIZIELL BESTÄTIGTEN Fußballspielen.
+    
+    DEINE AUFGABE:
+    Nutze Google Search (Grounding), um für JEDES dieser Spiele herauszufinden, welcher TV-Sender (in Deutschland/Österreich) es überträgt.
+    Suche nach: Sky, DAZN, Sat.1, Sport1, ORF, Amazon Prime, RTL.
+    
+    HIER IST DER SPIELPLAN (Ändere daran nichts, füge nur den Sender hinzu):
+    {matches_context}
+    
+    FORMAT-ANWEISUNG:
+    Gib mir eine Tabelle zurück. Trennzeichen: Pipe (|).
+    Spalten: Datum/Zeit | Wettbewerb | Paarung | SENDER
+    
+    WICHTIG:
+    - Wenn du keinen Sender findest, schreibe "-".
+    - Gib NUR die Tabelle zurück.
+    """
     
     try:
-        r = requests.get(url, timeout=4)
-        if r.status_code != 200:
-            return pd.DataFrame()
-            
-        data = r.json()
-        show_list = []
-        
-        for item in data:
-            show = item.get("show", {})
-            
-            # --- FILTER LOGIK ---
-            # Du wolltest KEINE Filme/Serien, nur Entertainment/Shows.
-            # TVMaze hat ein Feld 'type'.
-            # Typische Types: "Scripted" (Serie), "Reality", "Game Show", "Talk Show", "News", "Variety"
-            
-            show_type = show.get("type", "Unknown")
-            
-            # Wir definieren eine "Erlaubt"-Liste basierend auf deinen Wünschen
-            ALLOWED_TYPES = ["Reality", "Game Show", "Variety", "Award Show", "Panel Show", "Talent"]
-            
-            # Zusätzlich schließen wir News aus, behalten aber "Show"-artige Formate
-            if show_type in ALLOWED_TYPES:
-                
-                # SENDER FINDEN
-                # Entweder 'network' (TV) oder 'webChannel' (Streaming)
-                network = show.get("network")
-                web_channel = show.get("webChannel")
-                
-                sender_name = "-"
-                if network: sender_name = network.get("name")
-                elif web_channel: sender_name = web_channel.get("name")
-                
-                # UHRZEIT FILTER (Nur Primetime/Abendprogramm ab 18:00)
-                airtime = item.get("airtime", "00:00")
-                if airtime >= "18:00":
-                    show_list.append({
-                        "Datum": today.strftime("%d.%m.%Y"),
-                        "Uhrzeit": airtime,
-                        "Land": country_name,
-                        "Sender": sender_name,
-                        "Titel": show.get("name"),
-                        "Typ": show_type,
-                        "Episode": item.get("name")
-                    })
-                    
-        return pd.DataFrame(show_list)
-
+        response = model.generate_content(
+            prompt,
+            tools='google_search_retrieval'
+        )
+        return response.text
     except Exception as e:
-        return pd.DataFrame()
+        return f"Error bei Google Suche: {str(e)}"
 
-# --- FRONTEND UI ---
-
-st.title("📡 Live TV Guide (Pure API)")
-st.caption(f"Daten für Heute ({datetime.now().strftime('%d.%m.%Y')}) und Morgen.")
-
-tab_sport, tab_ent = st.tabs(["⚽️ SPORT (TheSportsDB)", "🎤 ENTERTAINMENT (TVMaze)"])
-
-# === TAB SPORT ===
-with tab_sport:
-    if st.button("Lade Sport-Daten", key="btn_sport"):
-        df = fetch_sports_schedule()
-        
-        if not df.empty:
-            # Sortieren nach Datum und Uhrzeit
-            df = df.sort_values(by=["Datum", "Uhrzeit"])
-            
-            st.success(f"{len(df)} Events in den Top-Ligen gefunden.")
-            
-            # Tabelle anzeigen
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Paarung / Event": st.column_config.TextColumn("Match / Event", width="large"),
-                    "Sender (Info)": st.column_config.TextColumn("TV Info (Int.)", width="medium"),
-                }
-            )
-        else:
-            st.warning("Keine Live-Events für heute/morgen in den konfigurierten Ligen gefunden.")
-            st.info("Hinweis: Dies kann an einer Spielpause liegen oder der kostenlose API-Key liefert für diese Nischen-Liga gerade keine Daten.")
-
-# === TAB ENTERTAINMENT ===
-with tab_ent:
-    col1, col2 = st.columns([1, 4])
+def parse_final_table(raw_text):
+    data = []
+    lines = raw_text.split('\n')
+    for line in lines:
+        if "|" in line:
+            parts = [p.strip() for p in line.split('|')]
+            # Wir erwarten ca. 4 Spalten
+            if len(parts) >= 4:
+                # Header ignorieren
+                if "Datum" in parts[0] or "---" in parts[0]: continue
+                # Validierung: Beginnt mit Zahl (Datum)?
+                if any(c.isdigit() for c in parts[0]):
+                    data.append(parts[:4])
     
-    with col1:
-        # Mapping Land -> ISO Code für TVMaze
-        country_select = st.selectbox("Land", [
-            ("DE", "Deutschland"),
-            ("US", "USA"),
-            ("GB", "Grossbritannien"),
-            ("AT", "Österreich") # TVMaze hat AT Daten, aber oft weniger als DE
-        ], format_func=lambda x: x[1])
+    if data:
+        return pd.DataFrame(data, columns=["Datum/Zeit", "Liga", "Paarung", "TV Sender (Google Search)"])
+    return None
+
+# --- FRONTEND ---
+
+st.title("⚽️ Smart TV Guide (API + AI)")
+st.caption(f"Spielplan: football-data.org | TV-Recherche: Google Gemini Live-Suche")
+
+if st.button("🚀 Live-Check starten", key="start"):
     
-    with col2:
-        st.write("") # Spacer
-        st.write("")
-        btn_ent = st.button("Lade Abendprogramm", key="btn_ent")
+    # 1. API DATEN HOLEN
+    match_list = get_confirmed_matches()
+    
+    if not match_list:
+        st.warning("Keine Spiele für Heute/Morgen in den Top-Ligen gefunden (oder API Limit).")
+    else:
+        st.info(f"{len(match_list)} Spiele gefunden. Starte TV-Recherche via Google... (Dauer ca. 5-10 Sek)")
         
-    if btn_ent:
-        code, name = country_select
-        with st.spinner(f"Lade Shows für {name}..."):
-            df_ent = fetch_entertainment_schedule(code, name)
+        # 2. GOOGLE RECHERCHE
+        with st.spinner("Google sucht die Sender..."):
+            raw_result = enrich_with_google(match_list)
             
-            if not df_ent.empty:
-                df_ent = df_ent.sort_values(by="Uhrzeit")
-                
-                st.success(f"{len(df_ent)} Primetime-Sendungen gefunden (Typ: Reality, Game Show, Variety).")
+            # 3. ANZEIGE
+            df = parse_final_table(raw_result)
+            
+            if df is not None:
+                st.success("Fertig!")
                 st.dataframe(
-                    df_ent,
+                    df,
                     use_container_width=True,
                     hide_index=True
                 )
             else:
-                st.warning(f"Keine passenden Shows (Reality/Game/Variety) ab 18:00 Uhr für {name} gefunden.")
-                st.caption("TVMaze liefert hauptsächlich Serien (Scripted). Wenn heute Abend nur Serien laufen, bleibt diese Liste leer, da wir Serien herausgefiltert haben.")
+                st.error("Formatierungsfehler. Hier ist der Rohtext:")
+                st.text(raw_result)
