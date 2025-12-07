@@ -4,186 +4,174 @@ import requests
 from datetime import datetime, timedelta
 
 # --- KONFIGURATION ---
-st.set_page_config(page_title="API TV Guide (Reduced Scope)", page_icon="📡", layout="wide")
+st.set_page_config(page_title="Minimal API TV Guide", page_icon="⚡️", layout="wide")
 
-# TheSportsDB Test Key
 TSDB_KEY = "3" 
 TSDB_BASE = f"https://www.thesportsdb.com/api/v1/json/{TSDB_KEY}"
 
-# REDUZIERTE LEAGUE MAPPING
-# Wir fokussieren uns auf die Top-Ligen (die besten Datenqualität haben)
+# Stark reduzierte Liste basierend auf den Vorgaben:
 LEAGUE_IDS = {
     "🇩🇪 Bundesliga": "4331",
     "🇦🇹 Bundesliga": "4333",
     "🇬🇧 Premier League": "4328",
     "🇪🇸 La Liga": "4335",
     "🇮🇹 Serie A": "4337",
-    "🏎️ Motorsport (F1)": "4370"
+    "🏎️ Formel 1 (F1)": "4370",
+    "🏍️ Moto GP": "4392",
+    "🎿 Ski Alpin": "4403", 
+    "🎯 Biathlon": "4410"
 }
 
-# TVMaze Country Codes
-COUNTRY_CODES = [
-    ("DE", "Deutschland"), 
-    ("AT", "Österreich"), 
-    ("CH", "Schweiz"),
-    ("US", "USA"), 
-    ("GB", "Grossbritannien"),
-    ("JP", "Japan"),
-    ("KR", "Südkorea")
-]
-
-# --- FUNKTIONEN ---
+# --- DATUMSFUNKTIONEN ---
 
 def get_dates():
+    # Wir holen die Daten für heute und morgen
     today = datetime.now().date()
     tomorrow = today + timedelta(days=1)
     return today, tomorrow
 
-## API SPORT DATEN FUNKTION
+# --- SPORT DATENABRUF ---
+
 def fetch_sports_data():
-    """Holt die nächsten 15 Events jeder Liga und filtert auf Heute/Morgen"""
+    """Holt die nächsten 15 Events jeder Liga, filtert auf Heute/Morgen und verwendet API-Spalten."""
     today, tomorrow = get_dates()
     all_events = []
     
+    st.info("ℹ️ Hinweis: Die Zeitangaben der API sind oft lokale Zeit des Events oder UTC.")
     progress_bar = st.progress(0)
     total_leagues = len(LEAGUE_IDS)
     
     for idx, (league_name, league_id) in enumerate(LEAGUE_IDS.items()):
+        # Abfrage: Nächste Events der Liga (funktioniert gut mit dem Test-Key)
         url = f"{TSDB_BASE}/eventsnextleague.php?id={league_id}"
         
         try:
             r = requests.get(url, timeout=5)
-            r.raise_for_status() # Raise exception for bad status codes
             data = r.json()
             
-            if data.get("events"):
+            if data and "events" in data and data["events"]:
                 for e in data["events"]:
                     event_date_str = e.get("dateEvent")
                     if not event_date_str: continue
                     
                     event_date = datetime.strptime(event_date_str, "%Y-%m-%d").date()
                     
+                    # Filterung auf Heute/Morgen
                     if event_date == today or event_date == tomorrow:
                         
-                        # API-BASIERTE SPALTEN
+                        # Wir verwenden direkt die API-Spalten (z.B. strEvent)
                         all_events.append({
                             "Datum": event_date.strftime("%d.%m.%Y"),
-                            "Uhrzeit (MEZ)": e.get("strTime", "00:00")[:5],
-                            "Sport": e.get("strSport", "Fußball"),
+                            "Uhrzeit (API)": e.get("strTime", "00:00")[:5], 
+                            "Sportart": e.get("strSport", "Sport"),
                             "Wettbewerb": league_name,
-                            "Match / Event": e.get("strEvent", "n.a."),
-                            "Heim": e.get("strHomeTeam", "-"),
-                            "Gast": e.get("strAwayTeam", "-"),
+                            "Paarung / Titel": e.get("strEvent", e.get("strEventAlternate")),
                             "TV Sender (Int.)": e.get("strTVStation", "-")
                         })
-        except requests.exceptions.RequestException as err:
-            st.error(f"Fehler bei API-Abruf für {league_name}: {err}")
+        except Exception as err:
+            st.warning(f"Fehler bei {league_name} (API nicht erreichbar).")
             
         progress_bar.progress((idx + 1) / total_leagues)
 
     progress_bar.empty()
     return pd.DataFrame(all_events)
 
-## API ENTERTAINMENT DATEN FUNKTION
+# --- ENTERTAINMENT DATENABRUF ---
+
 def fetch_tv_entertainment(country_code):
-    """Holt TV Schedule von TVMaze (Offene API)"""
-    today, _ = get_dates() 
+    """Holt das TV Schedule von TVMaze für heute"""
+    today, _ = get_dates()
     today_str = today.strftime("%Y-%m-%d")
     
+    # TVMaze API: Schedule für das gewählte Land
     url = f"https://api.tvmaze.com/schedule?country={country_code}&date={today_str}"
     
     try:
         r = requests.get(url, timeout=5)
-        r.raise_for_status()
+        r.raise_for_status() # Löst HTTPError für 4xx/5xx Antworten aus
         data = r.json()
         
         show_list = []
         for item in data:
             show = item.get("show", {})
             
-            # API-BASIERTE SPALTEN
+            # Wir verwenden die Spalten, die TVMaze liefert
             show_list.append({
                 "Uhrzeit": item.get("airtime", "00:00"),
-                "Sender": item.get("network", {}).get("name", "n.a."),
-                "Land": country_code,
-                "Show Titel": show.get("name"),
-                "Episoden Titel": item.get("name", "n.a."),
-                "Genre": ", ".join(show.get("genres", ["n.a."])),
-                "Typ": show.get("type", "n.a.")
+                "Sender": item.get("airing_on_channel", item.get("network", {}).get("name", "N/A")), # Versuch, Kanal zu finden
+                "Titel der Show": show.get("name"),
+                "Genre": ", ".join(show.get("genres", [])),
+                "Typ": show.get("type", "-"),
+                "Episode": item.get("name", "N/A")
             })
             
         return pd.DataFrame(show_list)
         
     except requests.exceptions.RequestException as e:
-        st.error(f"Fehler bei TVMaze API-Abruf für {country_code}: {e}")
+        st.error(f"Fehler bei TVMaze (Land '{country_code}'): Daten konnten nicht abgerufen werden.")
+        st.caption(f"Details: {e}")
         return pd.DataFrame()
 
 # --- FRONTEND ---
 
-st.title("📡 API-Basierter TV Guide")
-st.caption("Datenquelle: TheSportsDB (Sport) & TVMaze (Entertainment)")
+st.title("⚡️ API TV Guide (Minimal Scope)")
+st.caption("Daten für heute, den {} | Sport von TheSportsDB, Entertainment von TVMaze".format(datetime.now().strftime("%d.%m.%Y")))
 
-tab_sport, tab_ent = st.tabs(["⚽️ SPORT (Top Ligen)", "🎬 ENTERTAINMENT"])
+tab_sport, tab_ent = st.tabs(["⚽️ SPORT (Top Ligen)", "🎬 ENTERTAINMENT (Highlights)"])
 
 # === SPORT TAB ===
 with tab_sport:
-    st.subheader("Fokus: Top-Fußball-Ligen & Formel 1")
-    st.info("⚠️ Wintersport und allgemeine Highlights sind in dieser Sport-API (TheSportsDB) nicht verlässlich abgebildet. Wir fokussieren uns auf strukturierte Ligen.")
-    
-    if st.button("Lade Sport-Daten", key="sport_btn"):
+    if st.button("Lade Sport-Daten (Echtzeit)", key="sport_btn"):
         with st.spinner("Frage Sport-Datenbank ab..."):
             df = fetch_sports_data()
             
             if not df.empty:
-                # Sortieren
-                df = df.sort_values(by=["Datum", "Uhrzeit (MEZ)"])
+                df = df.sort_values(by=["Datum", "Uhrzeit (API)"])
                 
-                st.success(f"{len(df)} Live-Events für heute & morgen gefunden.")
+                st.success(f"{len(df)} Events gefunden.")
                 st.dataframe(
                     df,
                     use_container_width=True,
                     hide_index=True
                 )
             else:
-                st.warning("Keine Spiele für Heute/Morgen in den gewählten Top-Ligen gefunden.")
+                st.warning("Keine Events für Heute/Morgen in den gewählten Top-Ligen gefunden.")
 
-# ---
 # === ENTERTAINMENT TAB ===
 with tab_ent:
-    st.subheader("Globale Shows & Programm-Highlights")
     col1, col2 = st.columns([1,3])
-    
     with col1:
-        # Länderauswahl
-        selected_country = st.selectbox(
-            "Programm für Land wählen", 
-            COUNTRY_CODES, 
-            format_func=lambda x: f"{x[1]} ({x[0]})"
-        )
+        # Länderauswahl für TVMaze
+        country_code, country_name = st.selectbox("Land wählen", [
+            ("DE", "Deutschland"),
+            ("AT", "Österreich"),
+            ("CH", "Schweiz"),
+            ("US", "USA"), 
+            ("GB", "Grossbritannien"), 
+            ("JP", "Japan"),
+            ("KR", "Südkorea")
+        ], format_func=lambda x: x[1])
     
     with col2:
         st.write("") 
         st.write("")
-        load_ent = st.button("Lade TV Programm", key="ent_btn")
+        load_ent = st.button(f"Lade TV Programm für {country_name}", key="ent_btn")
 
     if load_ent:
-        with st.spinner(f"Lade Programm für {selected_country[1]}..."):
-            df_ent = fetch_tv_entertainment(selected_country[0])
+        with st.spinner(f"Lade Programm für {country_name}..."):
+            df_ent = fetch_tv_entertainment(country_code)
             
             if not df_ent.empty:
-                st.subheader(f"Highlights in {selected_country[1]} am {get_dates()[0].strftime('%d.%m.')}")
                 
-                # Filter auf Uhrzeit (ab 18:00 für Primetime)
-                df_ent_prime = df_ent[df_ent["Uhrzeit"] >= "18:00"].copy()
-                df_ent_prime = df_ent_prime.sort_values(by="Uhrzeit")
+                # Wir filtern hier nur die Primetime (19:00 - 23:00)
+                df_ent = df_ent[(df_ent["Uhrzeit"] >= "19:00") & (df_ent["Uhrzeit"] <= "23:59")]
+                df_ent = df_ent.sort_values(by="Uhrzeit")
                 
-                # Wir filtern die Spalten, um nur die relevantesten zu zeigen
-                display_cols = ["Uhrzeit", "Sender", "Show Titel", "Episoden Titel", "Genre", "Typ"]
-                
+                st.subheader("📺 Shows & Highlights (Primetime)")
                 st.dataframe(
-                    df_ent_prime[display_cols],
+                    df_ent,
                     use_container_width=True,
                     hide_index=True
                 )
             else:
-                st.warning(f"Keine Programm-Daten für {selected_country[1]} gefunden.")
+                st.warning("Keine Daten für dieses Land gefunden oder es läuft nichts zur Primetime.")
